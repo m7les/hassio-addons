@@ -48,14 +48,17 @@ async def interactor_call(client: httpx.AsyncClient, body: dict) -> dict:
 
 async def discover_switches(client: httpx.AsyncClient) -> list[Switch]:
     resp = await interactor_call(client, {"command": "discover"})
+    # `discover` puts devices directly under the top-level dict (no "results"
+    # wrapper), unlike `query`/`set`. Strip out non-device keys defensively.
     switches = []
-    for serial, info in resp.get("results", {}).items():
+    for serial, info in resp.items():
+        if not isinstance(info, dict) or not serial.startswith("d073d5"):
+            continue
         if "relays" in info.get("cap", []):
             label = info.get("label") or info.get("product_name") or serial
             switches.append(Switch(serial=serial, label=label))
             log.info("Discovered switch %s: %s", serial, label)
     return switches
-
 
 def _serial_to_mac(serial: str) -> str:
     return ":".join(serial[i:i + 2] for i in range(0, 12, 2))
