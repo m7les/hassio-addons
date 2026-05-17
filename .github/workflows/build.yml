@@ -1,0 +1,59 @@
+name: Build add-on images
+
+# Builds the add-on for each supported architecture and publishes the resulting
+# OCI images to GitHub Container Registry (ghcr.io). Triggered on:
+#   - pushes to main that touch the add-on's files (so version bumps publish)
+#   - manual dispatch (handy for re-publishing without code changes)
+#
+# Before this works for the first time:
+#   1. Edit the add-on's config.yaml and uncomment the `image:` line.
+#   2. Ensure the package visibility on ghcr.io is public (GitHub -> Packages
+#      -> select the package -> Package settings -> Change visibility).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lifx_switch_bridge/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, aarch64, armv7]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read add-on version
+        id: meta
+        run: |
+          VERSION=$(grep '^version:' lifx_switch_bridge/config.yaml | awk '{print $2}' | tr -d '"')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & publish image
+        uses: home-assistant/builder@2024.08.2
+        with:
+          args: |
+            --${{ matrix.arch }} \
+            --target lifx_switch_bridge \
+            --image "ghcr.io/${{ github.repository }}/{arch}-lifx_switch_bridge" \
+            --version "${{ steps.meta.outputs.version }}" \
+            --docker-hub-check \
+            --no-latest
