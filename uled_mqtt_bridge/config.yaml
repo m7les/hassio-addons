@@ -1,5 +1,5 @@
 name: "ULED-AT MQTT Bridge"
-version: "0.1.0"
+version: "0.2.0"
 slug: "uled_mqtt_bridge"
 description: "Direct MQTT bridge for Ubiquiti ULED-AT LED panels, bypassing the eot-controller."
 url: "https://github.com/m7les/hassio-addons/tree/main/uled_mqtt_bridge"

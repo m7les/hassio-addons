@@ -273,138 +273,254 @@ class LightBridge:
 
 
 # ---------------------------------------------------------------------------
-# HA command router
+# HA MQTT message router (single consumer of ha.messages)
 # ---------------------------------------------------------------------------
 
-async def ha_command_router(
+async def ha_message_router(
     ha: aiomqtt.Client,
-    bridges: dict[str, LightBridge],
+    bridges: dict[str, "LightBridge"],
     lights: dict[str, Light],
+    adopt_queue: asyncio.Queue,
+    discovery_prefix: str,
 ):
-    """Listen on uled/{id}/set and route commands to the right LightBridge."""
+    """
+    Single consumer for all HA MQTT messages.
+
+    Handles:
+      uled/{id}/set          — light brightness/on-off commands
+      uled/adopt/{mac}/set   — adoption button presses from HA UI
+    """
+    # Light commands for initially-configured lights
     for light_id in lights:
         await ha.subscribe(f"uled/{light_id}/set")
 
+    # Wildcard for adopt buttons published during discovery
+    await ha.subscribe("uled/adopt/+/set")
+
     async for msg in ha.messages:
-        parts = str(msg.topic).split("/")
-        if len(parts) != 3 or parts[2] != "set":
+        topic = str(msg.topic)
+        parts = topic.split("/")
+
+        # --- Adopt button: uled/adopt/<mac>/set ---
+        if len(parts) == 4 and parts[0] == "uled" and parts[1] == "adopt" and parts[3] == "set":
+            mac = parts[2]
+            log.info("Adopt request received for MAC %s", mac)
+            await adopt_queue.put(mac)
             continue
 
-        light_id = parts[1]
-        bridge = bridges.get(light_id)
-        light = lights.get(light_id)
-        if not bridge or not light:
-            continue
+        # --- Light command: uled/<id>/set ---
+        if len(parts) == 3 and parts[0] == "uled" and parts[2] == "set":
+            light_id = parts[1]
+            bridge = bridges.get(light_id)
+            light = lights.get(light_id)
+            if not bridge or not light:
+                continue
 
-        try:
-            cmd = json.loads(msg.payload)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            raw = msg.payload.decode(errors="replace").strip().upper()
-            cmd = {"state": raw}
+            try:
+                cmd = json.loads(msg.payload)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raw = msg.payload.decode(errors="replace").strip().upper()
+                cmd = {"state": raw}
 
-        state = cmd.get("state", "").upper()
-        brightness = cmd.get("brightness")
+            state = cmd.get("state", "").upper()
+            brightness = cmd.get("brightness")
 
-        if state == "OFF":
-            await bridge.send("v2/req/set/ledlamp/output", 0)
-            light.state.output = 0
-        elif state == "ON" or brightness is not None:
-            if light.state.output == 0:
-                await bridge.send("v2/req/set/ledlamp/output", 1)
-                light.state.output = 1
-            if brightness is not None:
-                b = max(0, min(255, int(brightness)))
-                await bridge.send("v2/req/set/ledlamp/led", b)
-                light.state.brightness = b
+            if state == "OFF":
+                await bridge.send("v2/req/set/ledlamp/output", 0)
+                light.state.output = 0
+            elif state == "ON" or brightness is not None:
+                if light.state.output == 0:
+                    await bridge.send("v2/req/set/ledlamp/output", 1)
+                    light.state.output = 1
+                if brightness is not None:
+                    b = max(0, min(255, int(brightness)))
+                    await bridge.send("v2/req/set/ledlamp/led", b)
+                    light.state.brightness = b
 
-        log.info("Command → %s: state=%s brightness=%s", light_id, state, brightness)
+            log.info("Command → %s: state=%s brightness=%s", light_id, state, brightness)
 
 
 # ---------------------------------------------------------------------------
 # Network discovery
 # ---------------------------------------------------------------------------
 
+async def _publish_pending_device(
+    ha: aiomqtt.Client,
+    panel: disco.DiscoveredDevice,
+    discovery_prefix: str,
+):
+    """
+    Publish two MQTT Discovery entities for an unadopted panel:
+      - A sensor showing device details (IP, MAC, firmware, etc.)
+      - A button that triggers adoption when pressed from the HA UI
+    Both are grouped under the same HA device card.
+    """
+    safe_mac = panel.mac.replace(":", "")
+    device_id = f"uled_pending_{safe_mac}"
+    display_name = panel.hostname or panel.mac
+
+    ha_device = {
+        "identifiers": [device_id],
+        "name": display_name,
+        "manufacturer": "Ubiquiti",
+        "model": panel.model or panel.platform,
+        "sw_version": panel.firmware,
+    }
+
+    # Sensor — shows adoption state + all attributes
+    sensor_cfg = {
+        "name": "Status",
+        "unique_id": f"{device_id}_status",
+        "state_topic": f"uled/pending/{safe_mac}/state",
+        "json_attributes_topic": f"uled/pending/{safe_mac}/attrs",
+        "icon": "mdi:lightbulb-question",
+        "device": ha_device,
+    }
+    await ha.publish(
+        f"{discovery_prefix}/sensor/{device_id}_status/config",
+        json.dumps(sensor_cfg),
+        retain=True,
+    )
+    await ha.publish(
+        f"uled/pending/{safe_mac}/state",
+        "unadopted" if not panel.adopted else "adopted_elsewhere",
+        retain=True,
+    )
+    await ha.publish(
+        f"uled/pending/{safe_mac}/attrs",
+        json.dumps({
+            "ip": panel.ip,
+            "mac": panel.mac,
+            "platform": panel.platform,
+            "firmware": panel.firmware,
+        }),
+        retain=True,
+    )
+
+    # Button — triggers adoption
+    button_cfg = {
+        "name": "Adopt",
+        "unique_id": f"{device_id}_adopt",
+        "command_topic": f"uled/adopt/{safe_mac}/set",
+        "payload_press": "adopt",
+        "icon": "mdi:plus-network",
+        "device": ha_device,
+    }
+    await ha.publish(
+        f"{discovery_prefix}/button/{device_id}_adopt/config",
+        json.dumps(button_cfg),
+        retain=True,
+    )
+
+    log.info(
+        "Surfaced unadopted panel in HA: %s (%s) at %s fw=%s",
+        display_name, panel.platform, panel.ip, panel.firmware,
+    )
+
+
+async def _remove_pending_device(
+    ha: aiomqtt.Client,
+    mac: str,
+    discovery_prefix: str,
+):
+    """Remove the pending sensor+button entities after adoption."""
+    safe_mac = mac.replace(":", "")
+    device_id = f"uled_pending_{safe_mac}"
+    await ha.publish(f"{discovery_prefix}/sensor/{device_id}_status/config", b"", retain=True)
+    await ha.publish(f"{discovery_prefix}/button/{device_id}_adopt/config", b"", retain=True)
+
+
 async def discovery_loop(
     ha: aiomqtt.Client,
-    known_lights: dict[str, Light],
+    lights: dict[str, Light],
+    discovered: dict[str, disco.DiscoveredDevice],
     discovery_prefix: str,
     poll_interval: int,
 ):
     """
-    Periodically scan the network for ULED-AT panels using Ubiquiti's UDP
-    discovery protocol (port 10001). Publishes unadopted panels as HA sensor
-    entities so they appear in the UI. Known/configured lights are skipped.
+    Periodically scan for ULED-AT panels via Ubiquiti UDP discovery (port 10001).
+    Unadopted panels that aren't already controlled are published to HA as a
+    sensor + adopt button grouped under the same device card.
     """
-    known_ips = {l.ip for l in known_lights.values()}
-    known_macs: set[str] = set()
-
     while True:
         log.info("Running network discovery scan...")
         try:
             panels = await disco.scan_led_panels(timeout=5.0)
-            log.info("Discovery found %d LED panel(s)", len(panels))
+            log.info("Discovery: found %d LED panel(s)", len(panels))
+
+            controlled_ips = {l.ip for l in lights.values()}
 
             for panel in panels:
-                # Skip lights already configured
-                if panel.ip in known_ips or panel.mac in known_macs:
-                    continue
+                if panel.ip in controlled_ips:
+                    continue  # already being managed
+                if panel.mac in discovered:
+                    continue  # already surfaced
 
-                safe_mac = panel.mac.replace(":", "")
-                entity_id = f"uled_discovered_{safe_mac}"
-
-                if panel.mac not in known_macs:
-                    known_macs.add(panel.mac)
-                    log.info(
-                        "New panel: %s %s at %s (adopted=%s fw=%s)",
-                        panel.platform, panel.hostname, panel.ip,
-                        panel.adopted, panel.firmware,
-                    )
-
-                # Publish as an HA sensor so it shows up in the UI
-                disc_payload = {
-                    "name": f"ULED {panel.hostname or panel.mac}",
-                    "unique_id": entity_id,
-                    "state_topic": f"uled/discovered/{safe_mac}/state",
-                    "json_attributes_topic": f"uled/discovered/{safe_mac}/attrs",
-                    "device": {
-                        "identifiers": [entity_id],
-                        "name": panel.hostname or panel.mac,
-                        "manufacturer": "Ubiquiti",
-                        "model": panel.model or panel.platform,
-                        "sw_version": panel.firmware,
-                    },
-                }
-                await ha.publish(
-                    f"{discovery_prefix}/sensor/{entity_id}/config",
-                    json.dumps(disc_payload),
-                    retain=True,
-                )
-                state = "adopted" if panel.adopted else "unadopted"
-                await ha.publish(
-                    f"uled/discovered/{safe_mac}/state",
-                    state,
-                    retain=True,
-                )
-                await ha.publish(
-                    f"uled/discovered/{safe_mac}/attrs",
-                    json.dumps({
-                        "ip": panel.ip,
-                        "mac": panel.mac,
-                        "eth_mac": panel.eth_mac,
-                        "hostname": panel.hostname,
-                        "platform": panel.platform,
-                        "model": panel.model,
-                        "firmware": panel.firmware,
-                        "adopted": panel.adopted,
-                    }),
-                    retain=True,
-                )
+                discovered[panel.mac] = panel
+                await _publish_pending_device(ha, panel, discovery_prefix)
 
         except Exception as exc:
             log.warning("Discovery scan failed: %s", exc)
 
-        # Re-scan every 5 poll intervals (not too aggressive)
         await asyncio.sleep(poll_interval * 5)
+
+
+# ---------------------------------------------------------------------------
+# Adoption handler
+# ---------------------------------------------------------------------------
+
+async def adoption_handler(
+    ha: aiomqtt.Client,
+    lights: dict[str, Light],
+    bridges: dict[str, LightBridge],
+    discovered: dict[str, disco.DiscoveredDevice],
+    adopt_queue: asyncio.Queue,
+    poll_interval: int,
+    discovery_prefix: str,
+):
+    """
+    Waits for adopt requests (MAC addresses) from the message router,
+    runs SSH adoption, then starts a LightBridge for the new device.
+    """
+    import adoption
+
+    while True:
+        mac = await adopt_queue.get()
+        panel = discovered.get(mac)
+        if not panel:
+            log.warning("Adopt request for unknown MAC %s — ignoring", mac)
+            continue
+
+        log.info("Starting adoption of %s (%s) at %s", panel.hostname, panel.platform, panel.ip)
+
+        # Update sensor state so the user sees feedback immediately
+        safe_mac = mac.replace(":", "")
+        await ha.publish(f"uled/pending/{safe_mac}/state", "adopting...", retain=True)
+
+        try:
+            device = await adoption.adopt(panel.ip, panel.hostname or panel.mac, mac)
+        except Exception as exc:
+            log.error("Adoption of %s failed: %s", panel.ip, exc)
+            await ha.publish(f"uled/pending/{safe_mac}/state", "adoption_failed", retain=True)
+            continue
+
+        # Remove the pending entities from HA
+        await _remove_pending_device(ha, mac, discovery_prefix)
+        discovered.pop(mac, None)
+
+        # Create a Light + LightBridge and start controlling it
+        light = Light(id=device["id"], name=device["name"], ip=device["ip"])
+        lights[light.id] = light
+        bridge = LightBridge(light, ha, poll_interval, discovery_prefix)
+        bridges[light.id] = bridge
+
+        # Subscribe to commands for this new light
+        await ha.subscribe(f"uled/{light.id}/set")
+
+        # Spawn the bridge task
+        asyncio.create_task(bridge.run(), name=f"bridge-{light.id}")
+
+        log.info("Adoption complete — now controlling %s as '%s'", panel.ip, light.name)
 
 
 # ---------------------------------------------------------------------------
@@ -412,11 +528,20 @@ async def discovery_loop(
 # ---------------------------------------------------------------------------
 
 async def main():
+    import adoption
+
     cfg = load_config()
 
-    lights = {
-        entry["id"]: Light(id=entry["id"], name=entry["name"], ip=entry["ip"])
-        for entry in cfg["lights"]
+    # Combine options-configured lights with previously adopted devices
+    all_entries = list(cfg["lights"])
+    persisted_macs = {e.get("mac") for e in all_entries if e.get("mac")}
+    for dev in adoption.load_adopted():
+        if dev.get("mac") not in persisted_macs:
+            all_entries.append(dev)
+
+    lights: dict[str, Light] = {
+        e["id"]: Light(id=e["id"], name=e["name"], ip=e["ip"])
+        for e in all_entries
     }
 
     mqtt = cfg["mqtt"]
@@ -425,24 +550,42 @@ async def main():
     poll_interval = cfg["poll_interval"]
     discovery_prefix = cfg["discovery_prefix"]
 
-    log.info("Connecting to HA MQTT broker at %s:%d", ha_host, ha_port)
+    log.info(
+        "Connecting to HA MQTT broker at %s:%d (%d light(s) configured)",
+        ha_host, ha_port, len(lights),
+    )
 
-    client_kwargs = {}
+    client_kwargs: dict = {}
     if mqtt.get("username"):
         client_kwargs["username"] = mqtt["username"]
         client_kwargs["password"] = mqtt.get("password", "")
 
-    async with aiomqtt.Client(ha_host, port=ha_port, **client_kwargs) as ha:
-        bridges = {
-            lid: LightBridge(light, ha, poll_interval, discovery_prefix)
-            for lid, light in lights.items()
-        }
+    # Shared mutable state (adoption handler extends these live)
+    bridges: dict[str, LightBridge] = {}
+    discovered: dict[str, disco.DiscoveredDevice] = {}
+    adopt_queue: asyncio.Queue = asyncio.Queue()
 
+    async with aiomqtt.Client(ha_host, port=ha_port, **client_kwargs) as ha:
+        # Build initial bridges
+        for light in lights.values():
+            bridges[light.id] = LightBridge(light, ha, poll_interval, discovery_prefix)
+
+        # Kick off all tasks; message router owns the ha.messages loop
         async with asyncio.TaskGroup() as tg:
             for bridge in bridges.values():
                 tg.create_task(bridge.run())
-            tg.create_task(ha_command_router(ha, bridges, lights))
-            tg.create_task(discovery_loop(ha, lights, discovery_prefix, poll_interval))
+            tg.create_task(
+                ha_message_router(ha, bridges, lights, adopt_queue, discovery_prefix)
+            )
+            tg.create_task(
+                discovery_loop(ha, lights, discovered, discovery_prefix, poll_interval)
+            )
+            tg.create_task(
+                adoption_handler(
+                    ha, lights, bridges, discovered,
+                    adopt_queue, poll_interval, discovery_prefix,
+                )
+            )
 
 
 if __name__ == "__main__":
