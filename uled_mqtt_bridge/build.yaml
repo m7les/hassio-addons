@@ -1,0 +1,9 @@
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base:latest
+  aarch64: ghcr.io/home-assistant/aarch64-base:latest
+  armv7: ghcr.io/home-assistant/armv7-base:latest
+labels:
+  org.opencontainers.image.title: "ULED-AT MQTT Bridge"
+  org.opencontainers.image.description: "Direct MQTT bridge for Ubiquiti ULED-AT LED panels"
+  org.opencontainers.image.source: "https://github.com/m7les/hassio-addons"
+  org.opencontainers.image.licenses: "MIT"
