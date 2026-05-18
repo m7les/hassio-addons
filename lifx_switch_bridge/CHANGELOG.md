@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.1.6
+- Fix device name in HA not updating immediately after a label rename; discovery is now re-published after `SetLabel` so the change reflects without a restart
+
 ## 0.1.5
 - Fix relay switch entities briefly reverting in HA after a command. The command handler now polls the relay immediately after `SetRPower` so HA receives the confirmed state without waiting for the next poll cycle.
 

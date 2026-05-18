@@ -459,6 +459,7 @@ async def handle_label_cmd(mqtt, http, sw, payload):
     await mqtt.publish(
         f"{TOPIC_PREFIX}/{sw.serial}/label/state", label, retain=True
     )
+    await publish_discovery(mqtt, [sw])
 
 
 async def handle_haptic_cmd(mqtt, http, sw, payload, cache):
