@@ -204,7 +204,7 @@ class LightBridge:
         s = self.light.state
         changed = False
         if "led" in payload:
-            b = int(payload["led"])
+            b = round(int(payload["led"]) * 255 / 100)
             if s.brightness != b:
                 s.brightness = b
                 changed = True
@@ -218,10 +218,10 @@ class LightBridge:
         if "power" in payload:
             s.power = payload["power"]
         if changed:
-            await self._publish_ha_state()
+            await self.publish_state()
             self._logger.info("brightness=%d output=%d", s.brightness, s.output)
 
-    async def _publish_ha_state(self):
+    async def publish_state(self):
         s = self.light.state
         await self.ha.publish(
             f"uled/{self.light.id}/state",
@@ -333,10 +333,13 @@ async def ha_message_router(
                     await bridge.send("v2/req/set/ledlamp/output", 1)
                     light.state.output = 1
                 if brightness is not None:
-                    b = max(0, min(255, int(brightness)))
-                    await bridge.send("v2/req/set/ledlamp/led", b)
-                    light.state.brightness = b
+                    ha_b = max(0, min(255, int(brightness)))
+                    device_b = round(ha_b * 100 / 255)
+                    await bridge.send("v2/req/set/ledlamp/led", device_b)
+                    light.state.brightness = ha_b
 
+            # Optimistic publish so HA stops retrying before the next poll
+            await bridge.publish_state()
             log.info("Command → %s: state=%s brightness=%s", light_id, state, brightness)
 
 
