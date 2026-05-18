@@ -453,10 +453,11 @@ async def discovery_loop(
             for panel in panels:
                 if panel.ip in controlled_ips:
                     continue  # already being managed
-                if panel.mac in discovered:
+                safe_mac = panel.mac.replace(":", "")
+                if safe_mac in discovered:
                     continue  # already surfaced
 
-                discovered[panel.mac] = panel
+                discovered[safe_mac] = panel  # keyed by safe_mac to match adopt topic
                 await _publish_pending_device(ha, panel, discovery_prefix)
 
         except Exception as exc:
