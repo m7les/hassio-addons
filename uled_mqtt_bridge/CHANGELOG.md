@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.3
+- Handle `v2/rsp/#` confirmation responses from device: state is now updated from device-confirmed values immediately after each command rather than waiting for the next poll
+
 ## 0.2.2
 - Fix brightness commands: device uses 0–100 scale, HA uses 0–255 — values were passed through unscaled causing the device to wrap (e.g. 138 → 37, 255 → ~53)
 - Fix HA retrying commands: after sending any command, immediately publish optimistic state to HA so it stops resending before the next 30s poll

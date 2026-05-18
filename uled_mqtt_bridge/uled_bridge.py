@@ -184,8 +184,34 @@ class LightBridge:
             except json.JSONDecodeError:
                 continue
 
-            if str(msg.topic) == "v2/controller/rsp/get":
+            topic = str(msg.topic)
+            if topic == "v2/controller/rsp/get":
                 await self._handle_status(payload)
+            elif topic.startswith("v2/rsp/"):
+                await self._handle_set_rsp(topic, payload)
+
+    async def _handle_set_rsp(self, topic: str, payload: dict):
+        # Topic is e.g. v2/rsp/set/ledlamp/led or v2/rsp/set/ledlamp/output
+        target = topic.split("/")[-1]
+        value = payload.get("value")
+        if value is None:
+            self._logger.debug("rsp %s payload (no 'value' key): %s", topic, payload)
+            return
+        s = self.light.state
+        changed = False
+        if target == "led":
+            b = round(int(value) * 255 / 100)
+            if s.brightness != b:
+                s.brightness = b
+                changed = True
+        elif target == "output":
+            o = int(value)
+            if s.output != o:
+                s.output = o
+                changed = True
+        if changed:
+            await self.publish_state()
+            self._logger.info("Confirmed %s=%s → brightness=%d output=%d", target, value, s.brightness, s.output)
 
     async def _poll_loop(self, dev: aiomqtt.Client):
         while True:
