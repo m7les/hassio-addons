@@ -381,7 +381,7 @@ async def rediscovery_loop(mqtt, http, switches, by_serial):
             log.exception("rediscovery error")
 
 
-async def handle_relay_cmd(http, sw, idx, payload):
+async def handle_relay_cmd(mqtt, http, sw, idx, payload):
     level = 65535 if payload.upper() == "ON" else 0
     await interactor_call(http, {
         "command": "set",
@@ -391,6 +391,7 @@ async def handle_relay_cmd(http, sw, idx, payload):
             "pkt_args": {"relay_index": idx, "level": level},
         },
     })
+    await poll_relay(mqtt, http, sw, idx)
 
 
 def _setconfig_args(current: dict) -> dict:
@@ -496,7 +497,7 @@ async def command_loop(mqtt, http, by_serial, cache):
             if not sw:
                 continue
             if kind == "relay":
-                await handle_relay_cmd(http, sw, int(rest[0]), payload)
+                await handle_relay_cmd(mqtt, http, sw, int(rest[0]), payload)
             elif kind == "backlight":
                 await handle_backlight_cmd(mqtt, http, sw, rest[0], payload, cache)
             elif kind == "label":
