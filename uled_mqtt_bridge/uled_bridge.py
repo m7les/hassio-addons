@@ -22,6 +22,8 @@ from typing import Optional
 import aiomqtt
 import yaml
 
+import discovery as disco
+
 # ---------------------------------------------------------------------------
 # Config loading — supports HA add-on (/data/options.json) and standalone
 # ---------------------------------------------------------------------------
@@ -319,6 +321,93 @@ async def ha_command_router(
 
 
 # ---------------------------------------------------------------------------
+# Network discovery
+# ---------------------------------------------------------------------------
+
+async def discovery_loop(
+    ha: aiomqtt.Client,
+    known_lights: dict[str, Light],
+    discovery_prefix: str,
+    poll_interval: int,
+):
+    """
+    Periodically scan the network for ULED-AT panels using Ubiquiti's UDP
+    discovery protocol (port 10001). Publishes unadopted panels as HA sensor
+    entities so they appear in the UI. Known/configured lights are skipped.
+    """
+    known_ips = {l.ip for l in known_lights.values()}
+    known_macs: set[str] = set()
+
+    while True:
+        log.info("Running network discovery scan...")
+        try:
+            panels = await disco.scan_led_panels(timeout=5.0)
+            log.info("Discovery found %d LED panel(s)", len(panels))
+
+            for panel in panels:
+                # Skip lights already configured
+                if panel.ip in known_ips or panel.mac in known_macs:
+                    continue
+
+                safe_mac = panel.mac.replace(":", "")
+                entity_id = f"uled_discovered_{safe_mac}"
+
+                if panel.mac not in known_macs:
+                    known_macs.add(panel.mac)
+                    log.info(
+                        "New panel: %s %s at %s (adopted=%s fw=%s)",
+                        panel.platform, panel.hostname, panel.ip,
+                        panel.adopted, panel.firmware,
+                    )
+
+                # Publish as an HA sensor so it shows up in the UI
+                disc_payload = {
+                    "name": f"ULED {panel.hostname or panel.mac}",
+                    "unique_id": entity_id,
+                    "state_topic": f"uled/discovered/{safe_mac}/state",
+                    "json_attributes_topic": f"uled/discovered/{safe_mac}/attrs",
+                    "device": {
+                        "identifiers": [entity_id],
+                        "name": panel.hostname or panel.mac,
+                        "manufacturer": "Ubiquiti",
+                        "model": panel.model or panel.platform,
+                        "sw_version": panel.firmware,
+                    },
+                }
+                await ha.publish(
+                    f"{discovery_prefix}/sensor/{entity_id}/config",
+                    json.dumps(disc_payload),
+                    retain=True,
+                )
+                state = "adopted" if panel.adopted else "unadopted"
+                await ha.publish(
+                    f"uled/discovered/{safe_mac}/state",
+                    state,
+                    retain=True,
+                )
+                await ha.publish(
+                    f"uled/discovered/{safe_mac}/attrs",
+                    json.dumps({
+                        "ip": panel.ip,
+                        "mac": panel.mac,
+                        "eth_mac": panel.eth_mac,
+                        "hostname": panel.hostname,
+                        "platform": panel.platform,
+                        "model": panel.model,
+                        "firmware": panel.firmware,
+                        "adopted": panel.adopted,
+                    }),
+                    retain=True,
+                )
+
+        except Exception as exc:
+            log.warning("Discovery scan failed: %s", exc)
+
+        # Re-scan every 5 poll intervals (not too aggressive)
+        await asyncio.sleep(poll_interval * 5)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -353,6 +442,7 @@ async def main():
             for bridge in bridges.values():
                 tg.create_task(bridge.run())
             tg.create_task(ha_command_router(ha, bridges, lights))
+            tg.create_task(discovery_loop(ha, lights, discovery_prefix, poll_interval))
 
 
 if __name__ == "__main__":
