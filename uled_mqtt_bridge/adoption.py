@@ -153,6 +153,7 @@ async def unadopt(ip: str, mac: str):
             connect_timeout=10,
         ) as conn:
             await conn.run("syswrapper.sh set-eot-adopt-state 0", check=False)
+            await conn.run("syswrapper.sh set-led-ctrler-uid \"\"", check=False)
             await conn.run("syswrapper.sh save-eot-config", check=False)
     except Exception as exc:
         log.warning("Could not SSH to %s for unadoption (removing locally anyway): %s", ip, exc)

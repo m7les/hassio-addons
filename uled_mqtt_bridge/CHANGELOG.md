@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.2
+- Fix reset leaving device as "adopted_elsewhere": unadopt now also clears the controller UUID (`set-led-ctrler-uid ""`), so the device reports as fully unadopted in the next discovery scan
+
 ## 0.3.1
 - Reset button on each adopted light's device card: SSHes into the device, clears adoption state, removes HA entities, cancels the bridge — device reappears as unadopted in the next discovery scan
 - Bridge tasks moved outside the infrastructure TaskGroup so individual bridges can be cancelled on reset without taking down the whole add-on
