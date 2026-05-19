@@ -1,5 +1,5 @@
 name: "ULED-AT MQTT Bridge"
-version: "0.2.4"
+version: "0.3.0"
 slug: "uled_mqtt_bridge"
 description: "Direct MQTT bridge for Ubiquiti ULED-AT LED panels, bypassing the eot-controller."
 url: "https://github.com/m7les/hassio-addons/tree/main/uled_mqtt_bridge"
@@ -16,10 +16,7 @@ host_network: true
 services:
   - mqtt:need
 options:
-  lights:
-    - id: "uled_1"
-      name: "ULED 1"
-      ip: "192.168.1.1"
+  lights: []
   poll_interval: 30
   discovery_prefix: "homeassistant"
 schema:

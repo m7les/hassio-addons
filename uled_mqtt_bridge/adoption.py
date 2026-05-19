@@ -81,6 +81,15 @@ def remove_adopted_device(mac: str):
     save_adopted(devices)
 
 
+def update_adopted_ip(mac: str, new_ip: str):
+    devices = load_adopted()
+    for d in devices:
+        if d.get("mac") == mac:
+            d["ip"] = new_ip
+            break
+    save_adopted(devices)
+
+
 # ---------------------------------------------------------------------------
 # SSH adoption
 # ---------------------------------------------------------------------------

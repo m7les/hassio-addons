@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+- IP healing: discovery scan now detects when an adopted device's IP changes (DHCP renewal) and updates the stored address and active bridge automatically — no manual intervention needed
+- Exponential backoff on reconnect: unreachable devices back off from 10s to 120s instead of retrying every 10s forever; reverts to fast retry after any successful connection
+- Empty `lights: []` default — no dummy entry to delete when relying entirely on discovery/adoption
+- Pin Alpine base image to 3.20 in `build.yaml` for reproducible builds
+- Add `DOCS.md` for HA add-on store help page; update `README.md` to cover discovery/adoption flow
+
 ## 0.2.4
 - Device does not respond to set commands — replaced dead `v2/rsp/#` handler with a post-command status poll (500ms after last queued command) for near-immediate confirmed state updates
 

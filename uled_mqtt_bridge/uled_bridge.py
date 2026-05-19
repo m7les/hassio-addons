@@ -22,6 +22,7 @@ from typing import Optional
 import aiomqtt
 import yaml
 
+import adoption
 import discovery as disco
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,7 @@ class Light:
     id: str
     name: str
     ip: str
+    mac: str = ""
     state: LightState = field(default_factory=LightState)
 
 
@@ -140,14 +142,20 @@ class LightBridge:
         self._logger = logging.getLogger(f"uled.{light.id}")
 
     async def run(self):
-        """Main reconnect loop."""
+        """Main reconnect loop with exponential backoff."""
+        delay = 10
         while True:
             try:
                 await self._session()
+                delay = 10
             except (aiomqtt.MqttError, OSError, ConnectionRefusedError) as exc:
-                self._logger.warning("Disconnected (%s), retry in 10s", exc)
+                was_online = self.light.state.online
+                self._logger.warning("Disconnected (%s), retry in %ds", exc, delay)
                 await self._set_availability(False)
-                await asyncio.sleep(10)
+                await asyncio.sleep(delay)
+                # If we were connected and then dropped, reset to fast retry.
+                # If we never connected, back off to avoid log spam.
+                delay = 10 if was_online else min(delay * 2, 120)
 
     async def send(self, topic: str, value=None):
         """Queue a command to the device (safe to call anytime)."""
@@ -458,16 +466,34 @@ async def discovery_loop(
             panels = await disco.scan_led_panels(timeout=5.0)
             log.info("Discovery: found %d LED panel(s)", len(panels))
 
-            controlled_ips = {l.ip for l in lights.values()}
+            # MAC → Light for adopted devices; IP set for manually configured ones
+            mac_to_light = {l.mac: l for l in lights.values() if l.mac}
+            manual_ips = {l.ip for l in lights.values() if not l.mac}
 
             for panel in panels:
-                if panel.ip in controlled_ips:
-                    continue  # already being managed
                 safe_mac = panel.mac.replace(":", "")
-                if safe_mac in discovered:
-                    continue  # already surfaced
 
-                discovered[safe_mac] = panel  # keyed by safe_mac to match adopt topic
+                # Adopted device — check for IP change
+                managed = mac_to_light.get(safe_mac)
+                if managed:
+                    if managed.ip != panel.ip:
+                        log.info(
+                            "IP change for %s: %s → %s (updating)",
+                            safe_mac, managed.ip, panel.ip,
+                        )
+                        managed.ip = panel.ip
+                        adoption.update_adopted_ip(safe_mac, panel.ip)
+                    continue
+
+                # Manually configured light (matched by IP, no MAC stored)
+                if panel.ip in manual_ips:
+                    continue
+
+                # Already surfaced as pending
+                if safe_mac in discovered:
+                    continue
+
+                discovered[safe_mac] = panel
                 await _publish_pending_device(ha, panel, discovery_prefix)
 
         except Exception as exc:
@@ -493,8 +519,6 @@ async def adoption_handler(
     Waits for adopt requests (MAC addresses) from the message router,
     runs SSH adoption, then starts a LightBridge for the new device.
     """
-    import adoption
-
     while True:
         mac = await adopt_queue.get()
         panel = discovered.get(mac)
@@ -520,7 +544,7 @@ async def adoption_handler(
         discovered.pop(mac, None)
 
         # Create a Light + LightBridge and start controlling it
-        light = Light(id=device["id"], name=device["name"], ip=device["ip"])
+        light = Light(id=device["id"], name=device["name"], ip=device["ip"], mac=device["mac"])
         lights[light.id] = light
         bridge = LightBridge(light, ha, poll_interval, discovery_prefix)
         bridges[light.id] = bridge
@@ -539,8 +563,6 @@ async def adoption_handler(
 # ---------------------------------------------------------------------------
 
 async def main():
-    import adoption
-
     cfg = load_config()
 
     # Combine options-configured lights with previously adopted devices
@@ -551,7 +573,7 @@ async def main():
             all_entries.append(dev)
 
     lights: dict[str, Light] = {
-        e["id"]: Light(id=e["id"], name=e["name"], ip=e["ip"])
+        e["id"]: Light(id=e["id"], name=e["name"], ip=e["ip"], mac=e.get("mac", ""))
         for e in all_entries
     }
 
