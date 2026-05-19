@@ -148,14 +148,18 @@ class LightBridge:
             try:
                 await self._session()
                 delay = 10
+            except asyncio.CancelledError:
+                raise
             except (aiomqtt.MqttError, OSError, ConnectionRefusedError) as exc:
                 was_online = self.light.state.online
                 self._logger.warning("Disconnected (%s), retry in %ds", exc, delay)
                 await self._set_availability(False)
                 await asyncio.sleep(delay)
-                # If we were connected and then dropped, reset to fast retry.
-                # If we never connected, back off to avoid log spam.
                 delay = 10 if was_online else min(delay * 2, 120)
+            except Exception as exc:
+                self._logger.error("Unexpected error: %s", exc, exc_info=True)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 120)
 
     async def send(self, topic: str, value=None):
         """Queue a command to the device (safe to call anytime)."""
@@ -257,6 +261,12 @@ class LightBridge:
 
     async def _publish_discovery(self):
         l = self.light
+        ha_device = {
+            "identifiers": [l.id],
+            "name": l.name,
+            "manufacturer": "Ubiquiti",
+            "model": "ULED-AT",
+        }
         config = {
             "name": l.name,
             "unique_id": f"uled_{l.id}",
@@ -269,18 +279,29 @@ class LightBridge:
             "payload_off": "OFF",
             "availability_topic": f"uled/{l.id}/availability",
             "qos": 0,
-            "device": {
-                "identifiers": [l.id],
-                "name": l.name,
-                "manufacturer": "Ubiquiti",
-                "model": "ULED-AT",
-            },
+            "device": ha_device,
         }
         await self.ha.publish(
             f"{self.discovery_prefix}/light/{l.id}/config",
             json.dumps(config),
             retain=True,
         )
+        # Reset button — only for adopted devices (those with a stored MAC)
+        if l.mac:
+            reset_cfg = {
+                "name": "Reset",
+                "unique_id": f"uled_{l.id}_reset",
+                "command_topic": f"uled/reset/{l.id}/set",
+                "payload_press": "reset",
+                "icon": "mdi:restore",
+                "entity_category": "config",
+                "device": ha_device,
+            }
+            await self.ha.publish(
+                f"{self.discovery_prefix}/button/{l.id}_reset/config",
+                json.dumps(reset_cfg),
+                retain=True,
+            )
 
     @staticmethod
     def _target_for(topic: str) -> str:
@@ -296,6 +317,7 @@ async def ha_message_router(
     bridges: dict[str, "LightBridge"],
     lights: dict[str, Light],
     adopt_queue: asyncio.Queue,
+    unadopt_queue: asyncio.Queue,
     discovery_prefix: str,
 ):
     """
@@ -304,13 +326,15 @@ async def ha_message_router(
     Handles:
       uled/{id}/set          — light brightness/on-off commands
       uled/adopt/{mac}/set   — adoption button presses from HA UI
+      uled/reset/{id}/set    — reset button presses from HA UI
     """
     # Light commands for initially-configured lights
     for light_id in lights:
         await ha.subscribe(f"uled/{light_id}/set")
 
-    # Wildcard for adopt buttons published during discovery
+    # Wildcards for adopt and reset buttons published during discovery/adoption
     await ha.subscribe("uled/adopt/+/set")
+    await ha.subscribe("uled/reset/+/set")
 
     async for msg in ha.messages:
         topic = str(msg.topic)
@@ -321,6 +345,13 @@ async def ha_message_router(
             mac = parts[2]
             log.info("Adopt request received for MAC %s", mac)
             await adopt_queue.put(mac)
+            continue
+
+        # --- Reset button: uled/reset/<light_id>/set ---
+        if len(parts) == 4 and parts[0] == "uled" and parts[1] == "reset" and parts[3] == "set":
+            light_id = parts[2]
+            log.info("Reset request received for %s", light_id)
+            await unadopt_queue.put(light_id)
             continue
 
         # --- Light command: uled/<id>/set ---
@@ -510,6 +541,7 @@ async def adoption_handler(
     ha: aiomqtt.Client,
     lights: dict[str, Light],
     bridges: dict[str, LightBridge],
+    bridge_tasks: dict[str, asyncio.Task],
     discovered: dict[str, disco.DiscoveredDevice],
     adopt_queue: asyncio.Queue,
     poll_interval: int,
@@ -552,10 +584,69 @@ async def adoption_handler(
         # Subscribe to commands for this new light
         await ha.subscribe(f"uled/{light.id}/set")
 
-        # Spawn the bridge task
-        asyncio.create_task(bridge.run(), name=f"bridge-{light.id}")
+        # Spawn the bridge task and track it so unadopt_handler can cancel it
+        task = asyncio.create_task(bridge.run(), name=f"bridge-{light.id}")
+        bridge_tasks[light.id] = task
 
         log.info("Adoption complete — now controlling %s as '%s'", panel.ip, light.name)
+
+
+# ---------------------------------------------------------------------------
+# Unadoption handler
+# ---------------------------------------------------------------------------
+
+async def _remove_light_device(
+    ha: aiomqtt.Client,
+    light_id: str,
+    discovery_prefix: str,
+):
+    """Clear all HA discovery entities for an adopted light."""
+    await ha.publish(f"{discovery_prefix}/light/{light_id}/config", b"", retain=True)
+    await ha.publish(f"{discovery_prefix}/button/{light_id}_reset/config", b"", retain=True)
+    await ha.publish(f"uled/{light_id}/availability", "offline", retain=True)
+
+
+async def unadopt_handler(
+    ha: aiomqtt.Client,
+    lights: dict[str, Light],
+    bridges: dict[str, LightBridge],
+    bridge_tasks: dict[str, asyncio.Task],
+    unadopt_queue: asyncio.Queue,
+    discovery_prefix: str,
+):
+    """
+    Waits for reset requests (light IDs) from the message router, SSHes into
+    the device to clear adoption state, removes HA entities, and cancels the
+    bridge so the device will reappear as unadopted in the next discovery scan.
+    """
+    while True:
+        light_id = await unadopt_queue.get()
+        light = lights.get(light_id)
+        if not light:
+            log.warning("Reset request for unknown light %s — ignoring", light_id)
+            continue
+
+        log.info("Resetting %s (%s) at %s", light.name, light.id, light.ip)
+
+        # SSH reset — unadopt() handles its own errors and always clears the store
+        await adoption.unadopt(light.ip, light.mac)
+
+        # Remove HA entities
+        await _remove_light_device(ha, light_id, discovery_prefix)
+
+        # Cancel the bridge task
+        task = bridge_tasks.pop(light_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        lights.pop(light_id, None)
+        bridges.pop(light_id, None)
+
+        log.info("Reset complete — %s will reappear in the next discovery scan", light.name)
 
 
 # ---------------------------------------------------------------------------
@@ -593,30 +684,42 @@ async def main():
         client_kwargs["username"] = mqtt["username"]
         client_kwargs["password"] = mqtt.get("password", "")
 
-    # Shared mutable state (adoption handler extends these live)
+    # Shared mutable state (adoption/unadoption handlers extend these live)
     bridges: dict[str, LightBridge] = {}
+    bridge_tasks: dict[str, asyncio.Task] = {}
     discovered: dict[str, disco.DiscoveredDevice] = {}
     adopt_queue: asyncio.Queue = asyncio.Queue()
+    unadopt_queue: asyncio.Queue = asyncio.Queue()
 
     async with aiomqtt.Client(ha_host, port=ha_port, **client_kwargs) as ha:
-        # Build initial bridges
+        # Bridge tasks run freely so individual ones can be cancelled on unadoption
+        # without affecting the infrastructure TaskGroup below.
         for light in lights.values():
-            bridges[light.id] = LightBridge(light, ha, poll_interval, discovery_prefix)
+            bridge = LightBridge(light, ha, poll_interval, discovery_prefix)
+            bridges[light.id] = bridge
+            bridge_tasks[light.id] = asyncio.create_task(
+                bridge.run(), name=f"bridge-{light.id}"
+            )
 
-        # Kick off all tasks; message router owns the ha.messages loop
+        # Infrastructure tasks: any unhandled exception here kills the add-on
+        # (which is correct — these are not recoverable).
         async with asyncio.TaskGroup() as tg:
-            for bridge in bridges.values():
-                tg.create_task(bridge.run())
             tg.create_task(
-                ha_message_router(ha, bridges, lights, adopt_queue, discovery_prefix)
+                ha_message_router(ha, bridges, lights, adopt_queue, unadopt_queue, discovery_prefix)
             )
             tg.create_task(
                 discovery_loop(ha, lights, discovered, discovery_prefix, poll_interval)
             )
             tg.create_task(
                 adoption_handler(
-                    ha, lights, bridges, discovered,
+                    ha, lights, bridges, bridge_tasks, discovered,
                     adopt_queue, poll_interval, discovery_prefix,
+                )
+            )
+            tg.create_task(
+                unadopt_handler(
+                    ha, lights, bridges, bridge_tasks,
+                    unadopt_queue, discovery_prefix,
                 )
             )
 

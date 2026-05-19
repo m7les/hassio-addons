@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+- Reset button on each adopted light's device card: SSHes into the device, clears adoption state, removes HA entities, cancels the bridge — device reappears as unadopted in the next discovery scan
+- Bridge tasks moved outside the infrastructure TaskGroup so individual bridges can be cancelled on reset without taking down the whole add-on
+- Catch-all exception handler in bridge run loop so unexpected errors are logged rather than silently dropped
+
 ## 0.3.0
 - IP healing: discovery scan now detects when an adopted device's IP changes (DHCP renewal) and updates the stored address and active bridge automatically — no manual intervention needed
 - Exponential backoff on reconnect: unreachable devices back off from 10s to 120s instead of retrying every 10s forever; reverts to fast retry after any successful connection
