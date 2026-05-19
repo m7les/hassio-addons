@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.7
+- Parallelise polling: all switches are now polled simultaneously via `asyncio.gather` instead of sequentially, eliminating the progressive wave of state updates across switches
+- Parallelise slow polls: backlight, label, and diagnostics queries run concurrently within each switch on slow-poll cycles
+- Parallelise command handling: incoming MQTT commands are dispatched as concurrent tasks so simultaneous commands to multiple switches fire against Photons immediately rather than queuing
+
 ## 0.1.6
 - Fix device name in HA not updating immediately after a label rename; discovery is now re-published after `SetLabel` so the change reflects without a restart
 

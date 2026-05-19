@@ -329,38 +329,50 @@ async def poll_diagnostics(mqtt, http, sw):
         log.debug("GetHostFirmware failed for %s", sw.serial)
 
 
+async def _poll_switch(mqtt, http, sw, cache, do_slow):
+    relay_ok = False
+    for idx in range(sw.relay_count):
+        if await poll_relay(mqtt, http, sw, idx):
+            relay_ok = True
+    if do_slow:
+        await asyncio.gather(
+            poll_backlight(mqtt, http, sw, cache),
+            poll_label(mqtt, http, sw),
+            poll_diagnostics(mqtt, http, sw),
+            return_exceptions=True,
+        )
+    return relay_ok
+
+
 async def poll_loop(mqtt, http, switches, cache):
     counter = 0
     backlight_every = max(1, int(BACKLIGHT_POLL_INTERVAL / POLL_INTERVAL))
     device_online: dict[str, bool] = {}
 
     while True:
-        for sw in list(switches):
-            try:
-                relay_ok = False
-                for idx in range(sw.relay_count):
-                    if await poll_relay(mqtt, http, sw, idx):
-                        relay_ok = True
-                if counter % backlight_every == 0:
-                    await poll_backlight(mqtt, http, sw, cache)
-                    await poll_label(mqtt, http, sw)
-                    await poll_diagnostics(mqtt, http, sw)
-
-                was = device_online.get(sw.serial)
-                if relay_ok != was:
-                    status = "online" if relay_ok else "offline"
-                    await mqtt.publish(
-                        f"{TOPIC_PREFIX}/{sw.serial}/availability", status, retain=True
-                    )
-                    device_online[sw.serial] = relay_ok
-                    log.info("Switch %s is %s", sw.serial, status)
-            except Exception:
+        do_slow = (counter % backlight_every == 0)
+        current = list(switches)
+        results = await asyncio.gather(
+            *[_poll_switch(mqtt, http, sw, cache, do_slow) for sw in current],
+            return_exceptions=True,
+        )
+        for sw, result in zip(current, results):
+            if isinstance(result, Exception):
                 log.exception("poll error for %s", sw.serial)
                 if device_online.get(sw.serial) is not False:
                     await mqtt.publish(
                         f"{TOPIC_PREFIX}/{sw.serial}/availability", "offline", retain=True
                     )
                     device_online[sw.serial] = False
+            else:
+                was = device_online.get(sw.serial)
+                if result != was:
+                    status = "online" if result else "offline"
+                    await mqtt.publish(
+                        f"{TOPIC_PREFIX}/{sw.serial}/availability", status, retain=True
+                    )
+                    device_online[sw.serial] = result
+                    log.info("Switch %s is %s", sw.serial, status)
 
         counter += 1
         await asyncio.sleep(POLL_INTERVAL)
@@ -482,6 +494,25 @@ async def handle_haptic_cmd(mqtt, http, sw, payload, cache):
     )
 
 
+async def _dispatch_command(mqtt, http, by_serial, cache, topic, payload):
+    parts = topic.split("/")
+    try:
+        _, serial, kind, *rest = parts
+        sw = by_serial.get(serial)
+        if not sw:
+            return
+        if kind == "relay":
+            await handle_relay_cmd(mqtt, http, sw, int(rest[0]), payload)
+        elif kind == "backlight":
+            await handle_backlight_cmd(mqtt, http, sw, rest[0], payload, cache)
+        elif kind == "label":
+            await handle_label_cmd(mqtt, http, sw, payload)
+        elif kind == "haptic":
+            await handle_haptic_cmd(mqtt, http, sw, payload, cache)
+    except Exception:
+        log.exception("command error on %s: %r", topic, payload)
+
+
 async def command_loop(mqtt, http, by_serial, cache):
     await mqtt.subscribe(f"{TOPIC_PREFIX}/+/relay/+/set")
     await mqtt.subscribe(f"{TOPIC_PREFIX}/+/backlight/+/set")
@@ -489,24 +520,12 @@ async def command_loop(mqtt, http, by_serial, cache):
     await mqtt.subscribe(f"{TOPIC_PREFIX}/+/haptic/set")
 
     async for message in mqtt.messages:
-        topic = message.topic.value
-        payload = message.payload.decode()
-        parts = topic.split("/")
-        try:
-            _, serial, kind, *rest = parts
-            sw = by_serial.get(serial)
-            if not sw:
-                continue
-            if kind == "relay":
-                await handle_relay_cmd(mqtt, http, sw, int(rest[0]), payload)
-            elif kind == "backlight":
-                await handle_backlight_cmd(mqtt, http, sw, rest[0], payload, cache)
-            elif kind == "label":
-                await handle_label_cmd(mqtt, http, sw, payload)
-            elif kind == "haptic":
-                await handle_haptic_cmd(mqtt, http, sw, payload, cache)
-        except Exception:
-            log.exception("command error on %s: %r", topic, payload)
+        asyncio.create_task(
+            _dispatch_command(
+                mqtt, http, by_serial, cache,
+                message.topic.value, message.payload.decode(),
+            )
+        )
 
 
 async def main():
