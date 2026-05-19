@@ -1,7 +1,7 @@
 # Changelog
 
-## 0.2.3
-- Handle `v2/rsp/#` confirmation responses from device: state is now updated from device-confirmed values immediately after each command rather than waiting for the next poll
+## 0.2.4
+- Device does not respond to set commands — replaced dead `v2/rsp/#` handler with a post-command status poll (500ms after last queued command) for near-immediate confirmed state updates
 
 ## 0.2.2
 - Fix brightness commands: device uses 0–100 scale, HA uses 0–255 — values were passed through unscaled causing the device to wrap (e.g. 138 → 37, 255 → ~53)
