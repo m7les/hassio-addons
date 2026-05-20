@@ -31,6 +31,8 @@ TOPIC_PREFIX = os.environ.get("MQTT_TOPIC_PREFIX", "lifx_switch")
 DISC_PREFIX = "homeassistant"
 AVAIL_TOPIC = f"{TOPIC_PREFIX}/bridge/availability"
 
+_mqtt_lock = asyncio.Lock()
+
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("lifx-bridge")
 
@@ -39,6 +41,11 @@ _CACHE_DEFAULTS = {
     "off_hue": 0, "off_sat": 0, "off_bri": 4096, "off_kelvin": 3500,
     "haptic": 50,
 }
+
+
+async def mqtt_publish(mqtt, topic, payload, **kw):
+    async with _mqtt_lock:
+        await mqtt.publish(topic, payload, **kw)
 
 
 @dataclass
@@ -193,21 +200,21 @@ async def publish_discovery(mqtt: MQTTClient, switches: list[Switch]) -> None:
     for sw in switches:
         for idx in range(sw.relay_count):
             topic, payload = discovery_payload_relay(sw, idx)
-            await mqtt.publish(topic, json.dumps(payload), retain=True)
+            await mqtt_publish(mqtt, topic, json.dumps(payload), retain=True)
         for which in ("on", "off"):
             topic, payload = discovery_payload_backlight(sw, which)
-            await mqtt.publish(topic, json.dumps(payload), retain=True)
+            await mqtt_publish(mqtt, topic, json.dumps(payload), retain=True)
         topic, payload = discovery_payload_label(sw)
-        await mqtt.publish(topic, json.dumps(payload), retain=True)
+        await mqtt_publish(mqtt, topic, json.dumps(payload), retain=True)
         topic, payload = discovery_payload_haptic(sw)
-        await mqtt.publish(topic, json.dumps(payload), retain=True)
+        await mqtt_publish(mqtt, topic, json.dumps(payload), retain=True)
         topic, payload = discovery_payload_rssi(sw)
-        await mqtt.publish(topic, json.dumps(payload), retain=True)
+        await mqtt_publish(mqtt, topic, json.dumps(payload), retain=True)
         topic, payload = discovery_payload_firmware(sw)
-        await mqtt.publish(topic, json.dumps(payload), retain=True)
+        await mqtt_publish(mqtt, topic, json.dumps(payload), retain=True)
         # Mark offline until the first successful poll confirms reachability.
-        await mqtt.publish(
-            f"{TOPIC_PREFIX}/{sw.serial}/availability", "offline", retain=True
+        await mqtt_publish(
+            mqtt, f"{TOPIC_PREFIX}/{sw.serial}/availability", "offline", retain=True
         )
         log.info("Published discovery for %s", sw.serial)
 
@@ -227,8 +234,8 @@ async def poll_relay(mqtt, http, sw, idx) -> bool:
     payload = next(iter(results.values())).get("payload", {})
     level = payload.get("level", 0)
     state = "ON" if level > 0 else "OFF"
-    await mqtt.publish(
-        f"{TOPIC_PREFIX}/{sw.serial}/relay/{idx}/state", state, retain=True
+    await mqtt_publish(
+        mqtt, f"{TOPIC_PREFIX}/{sw.serial}/relay/{idx}/state", state, retain=True
     )
     return True
 
@@ -249,8 +256,8 @@ async def poll_backlight(mqtt, http, sw, cache):
     current = cache.setdefault(sw.serial, dict(_CACHE_DEFAULTS))
     haptic = payload.get("haptic_duration_ms", 50)
     current["haptic"] = haptic
-    await mqtt.publish(
-        f"{TOPIC_PREFIX}/{sw.serial}/haptic/state", str(haptic), retain=True
+    await mqtt_publish(
+        mqtt, f"{TOPIC_PREFIX}/{sw.serial}/haptic/state", str(haptic), retain=True
     )
 
     for which in ("on", "off"):
@@ -272,7 +279,8 @@ async def poll_backlight(mqtt, http, sw, cache):
             },
             "color_temp": round(1_000_000 / kelvin) if kelvin else 333,
         }
-        await mqtt.publish(
+        await mqtt_publish(
+            mqtt,
             f"{TOPIC_PREFIX}/{sw.serial}/backlight/{which}/state",
             json.dumps(state_msg),
             retain=True,
@@ -291,8 +299,8 @@ async def poll_label(mqtt, http, sw):
     if not results:
         return
     label = next(iter(results.values())).get("payload", {}).get("label", "")
-    await mqtt.publish(
-        f"{TOPIC_PREFIX}/{sw.serial}/label/state", label, retain=True
+    await mqtt_publish(
+        mqtt, f"{TOPIC_PREFIX}/{sw.serial}/label/state", label, retain=True
     )
 
 
@@ -306,8 +314,8 @@ async def poll_diagnostics(mqtt, http, sw):
         if results:
             signal = next(iter(results.values())).get("payload", {}).get("signal", 0)
             rssi = round(10 * math.log10(signal), 1) if signal > 0 else -100
-            await mqtt.publish(
-                f"{TOPIC_PREFIX}/{sw.serial}/rssi/state", str(rssi), retain=True
+            await mqtt_publish(
+                mqtt, f"{TOPIC_PREFIX}/{sw.serial}/rssi/state", str(rssi), retain=True
             )
     except Exception:
         log.debug("GetWifiInfo failed for %s", sw.serial)
@@ -320,7 +328,8 @@ async def poll_diagnostics(mqtt, http, sw):
         results = resp.get("results", {})
         if results:
             p = next(iter(results.values())).get("payload", {})
-            await mqtt.publish(
+            await mqtt_publish(
+                mqtt,
                 f"{TOPIC_PREFIX}/{sw.serial}/firmware/state",
                 f"{p.get('version_major', 0)}.{p.get('version_minor', 0)}",
                 retain=True,
@@ -360,7 +369,8 @@ async def poll_loop(mqtt, http, switches, cache):
             if isinstance(result, Exception):
                 log.exception("poll error for %s", sw.serial)
                 if device_online.get(sw.serial) is not False:
-                    await mqtt.publish(
+                    await mqtt_publish(
+                        mqtt,
                         f"{TOPIC_PREFIX}/{sw.serial}/availability", "offline", retain=True
                     )
                     device_online[sw.serial] = False
@@ -368,7 +378,8 @@ async def poll_loop(mqtt, http, switches, cache):
                 was = device_online.get(sw.serial)
                 if result != was:
                     status = "online" if result else "offline"
-                    await mqtt.publish(
+                    await mqtt_publish(
+                        mqtt,
                         f"{TOPIC_PREFIX}/{sw.serial}/availability", status, retain=True
                     )
                     device_online[sw.serial] = result
@@ -468,8 +479,8 @@ async def handle_label_cmd(mqtt, http, sw, payload):
         },
     })
     sw.label = label
-    await mqtt.publish(
-        f"{TOPIC_PREFIX}/{sw.serial}/label/state", label, retain=True
+    await mqtt_publish(
+        mqtt, f"{TOPIC_PREFIX}/{sw.serial}/label/state", label, retain=True
     )
     await publish_discovery(mqtt, [sw])
 
@@ -489,8 +500,8 @@ async def handle_haptic_cmd(mqtt, http, sw, payload, cache):
             "pkt_args": _setconfig_args(current),
         },
     })
-    await mqtt.publish(
-        f"{TOPIC_PREFIX}/{sw.serial}/haptic/state", str(ms), retain=True
+    await mqtt_publish(
+        mqtt, f"{TOPIC_PREFIX}/{sw.serial}/haptic/state", str(ms), retain=True
     )
 
 
@@ -535,9 +546,18 @@ async def main():
         loop.add_signal_handler(sig, stop_event.set)
 
     async with httpx.AsyncClient() as http:
-        switches = await discover_switches(http)
+        switches = []
+        while not stop_event.is_set() and not switches:
+            try:
+                switches = await discover_switches(http)
+                if not switches:
+                    log.error("No switches found via Interactor at %s, retrying in 10s", INTERACTOR)
+                    await asyncio.sleep(10)
+            except Exception:
+                log.warning("Cannot reach Photons at %s, retrying in 10s", INTERACTOR)
+                await asyncio.sleep(10)
+
         if not switches:
-            log.error("No switches found via Interactor at %s", INTERACTOR)
             return
 
         by_serial: dict[str, Switch] = {sw.serial: sw for sw in switches}
@@ -555,7 +575,7 @@ async def main():
                 ) as mqtt:
                     log.info("Connected to MQTT %s:%d", MQTT_HOST, MQTT_PORT)
                     await publish_discovery(mqtt, switches)
-                    await mqtt.publish(AVAIL_TOPIC, "online", retain=True)
+                    await mqtt_publish(mqtt, AVAIL_TOPIC, "online", retain=True)
                     tasks = [
                         asyncio.create_task(poll_loop(mqtt, http, switches, cache)),
                         asyncio.create_task(command_loop(mqtt, http, by_serial, cache)),
@@ -569,7 +589,7 @@ async def main():
                         t.cancel()
                         with suppress(asyncio.CancelledError):
                             await t
-                    await mqtt.publish(AVAIL_TOPIC, "offline", retain=True)
+                    await mqtt_publish(mqtt, AVAIL_TOPIC, "offline", retain=True)
             except MqttError:
                 log.exception("MQTT lost; reconnecting in 5s")
                 await asyncio.sleep(5)

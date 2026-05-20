@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.8
+- Fix MQTT disconnect (error code 128) under parallel polling: serialise all `mqtt.publish` calls through an asyncio lock so concurrent poll results don't overwhelm Mosquitto
+- Fix startup crash when Photons Interactor is not yet reachable: discovery now retries every 10 s instead of crashing
+
 ## 0.1.7
 - Parallelise polling: all switches are now polled simultaneously via `asyncio.gather` instead of sequentially, eliminating the progressive wave of state updates across switches
 - Parallelise slow polls: backlight, label, and diagnostics queries run concurrently within each switch on slow-poll cycles

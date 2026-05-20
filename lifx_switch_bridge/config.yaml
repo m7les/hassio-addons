@@ -1,5 +1,5 @@
 name: "LIFX Switch Bridge"
-version: "0.1.7"
+version: "0.1.8"
 slug: "lifx_switch_bridge"
 description: "Exposes LIFX Switch relays and backlights to Home Assistant via Photons Interactor + MQTT."
 url: "https://github.com/m7les/hassio-addons/tree/main/lifx_switch_bridge"
